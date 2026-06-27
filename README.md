@@ -78,7 +78,7 @@ Se un ID Anki inserito in una nota markdown viene cancellato, modificato per err
 
 ## 🛠️ Configurazione Avanzata (`data.json`)
 
-Le impostazioni più avanzate destinate ai Power User sono configurabili direttamente nel file [data.json](file:///.obsidian/plugins/flashcards-extended/data.json) situato nella cartella del plugin:
+Le impostazioni più avanzate destinate ai Power User sono configurabili direttamente nel file [data.json](data.json) situato nella cartella del plugin:
 
 ```json
 {
@@ -107,6 +107,6 @@ Le impostazioni più avanzate destinate ai Power User sono configurabili diretta
 ## 📝 Sintassi dei Test e Esempi
 
 Per testare tutte le funzionalità del plugin in modo interattivo e convalidare la robustezza del parser, puoi consultare o creare i file di test inclusi nella suite di collaudo:
-* **Tipi di Nota:** [test_note_types.md](file:///c:/Users/giuly/OneDrive/Documenti/Obsidian/github/test_note_types.md) (Inline, Multiline, Cloze Multipli).
-* **Gestione Errori:** [test_error_handling.md](file:///c:/Users/giuly/OneDrive/Documenti/Obsidian/github/test_error_handling.md) (Esclusione di blocchi di codice, formule con graffe LaTeX e cloze matematici).
-* **Media & Audio:** [test_media.md](file:///c:/Users/giuly/OneDrive/Documenti/Obsidian/github/test_media.md) (Sincronizzazione di immagini e registrazioni audio).
+* **Tipi di Nota:** [test_note_types.md](test_note_types.md) (Inline, Multiline, Cloze Multipli).
+* **Gestione Errori:** [test_error_handling.md](test_error_handling.md) (Esclusione di blocchi di codice, formule con graffe LaTeX e cloze matematici).
+* **Media & Audio:** [test_media.md](test_media.md) (Sincronizzazione di immagini e registrazioni audio).
