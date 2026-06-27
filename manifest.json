@@ -1,0 +1,9 @@
+{
+  "id": "flashcards-extended",
+  "name": "Flashcards Extended",
+  "version": "2.0.4",
+  "minAppVersion": "0.15.0",
+  "description": "A lightweight, clean, and blazing fast way to sync markdown flashcards to Anki.",
+  "author": "Giulzon",
+  "isDesktopOnly": false
+}

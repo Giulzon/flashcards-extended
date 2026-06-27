@@ -1,0 +1,2131 @@
+const { Plugin, PluginSettingTab, Setting, Notice, addIcon, parseFrontMatterEntry } = require("obsidian");
+
+const parseFME = parseFrontMatterEntry || ((fm, key) => fm ? fm[key] : undefined);
+
+function arrayBufferToBase64(buffer) {
+    let binary = "";
+    let bytes = new Uint8Array(buffer);
+    let len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+// =====================================================================================
+// 1. LIGHTWEIGHT MD-TO-HTML FORMATTER (Placeholder-Shielded Compiler)
+// =====================================================================================
+class MDFormatter {
+    static makeHtml(md, vaultName = "") {
+        if (!md) return "";
+        let html = md;
+
+        let placeholders = [];
+        let placeholderCounter = 0;
+
+        function store(block) {
+            const ph = `\uFFFCPLH${placeholderCounter++}\uFFFC`;
+            placeholders.push({ placeholder: ph, content: block });
+            return ph;
+        }
+
+        // 1. Fenced Code Blocks: Extract and protect
+        html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (match, lang, code) => {
+            const escapedCode = MDFormatter.escapeHtml(code.trim());
+            const langClass = lang ? ` class="language-${lang}"` : '';
+            return store(`<pre><code${langClass}>${escapedCode}</code></pre>`);
+        });
+
+        // 2. Inline Code: Extract and protect
+        html = html.replace(/`(.*?)`/g, (match, code) => {
+            return store(`<code>${MDFormatter.escapeHtml(code)}</code>`);
+        });
+
+        // 3. Math blocks: Extract and protect
+        html = html.replace(/\$\$(.*?)\$\$/gs, (match, formula) => {
+            return store(`<anki-mathjax block="true">${formula.trim()}</anki-mathjax>`);
+        });
+
+        // 4. Math inline: Extract and protect
+        html = html.replace(/\$(.*?)\$/g, (match, formula) => {
+            return store(`<anki-mathjax>${formula.trim()}</anki-mathjax>`);
+        });
+
+        // 5. Protect pre-existing HTML tags
+        html = html.replace(/<[^>]+>/g, (match) => {
+            return store(match);
+        });
+
+        // 6. Wikilinks images: Extract and protect
+        html = html.replace(/!\[\[(.*\.(?:png|jpg|jpeg|gif|bmp|svg|tiff))(?:\|.*?)?\]\]/gim, (match, file) => {
+            return store(`<img src="${file}">`);
+        });
+
+        // 7. Markdown images: Extract and protect
+        html = html.replace(/!\[\]\((.*\.(?:png|jpg|jpeg|gif|bmp|svg|tiff))\)/gim, (match, file) => {
+            return store(`<img src="${file}">`);
+        });
+
+        // 8. Wikilinks audio: Extract and protect
+        html = html.replace(/!\[\[(.*\.(?:mp3|webm|wav|m4a|ogg|3gp|flac))\]\]/gim, (match, file) => {
+            return store(`[sound:${file}]`);
+        });
+
+        // 9. Standard Markdown links: Extract and protect
+        html = html.replace(/\[(.*?)\]\((.*?)\)/g, (match, text, url) => {
+            return store(`<a href="${url}">${text}</a>`);
+        });
+
+        // 10. Obsidian Wikilinks: Convert, extract and protect
+        let encVault = encodeURIComponent(vaultName);
+        html = html.replace(/\[\[(.+?)(?:\|(.+?))?\]\]/gim, (match, path, alias) => {
+            let encPath = encodeURIComponent(path);
+            let linkHtml = `<a href="obsidian://open?vault=${encVault}&file=${encPath}.md">${alias || path}</a>`;
+            return store(linkHtml);
+        });
+
+        // 10.5 Convert Bullet Lists
+        // Wraps consecutive list items in <ul><li>...</li></ul>
+        html = html.replace(/(?:^|\n)( {0,4}(?:[-*+]|\d+\.) .*?(?:\r?\n|$))+/g, (match) => {
+            let prefix = match.startsWith('\n') || match.startsWith('\r\n') ? match.match(/^\r?\n/)[0] : '';
+            let listType = match.match(/^\s*\n?\s*\d+\./) ? 'ol' : 'ul';
+            let items = match.trim().split(/\r?\n/);
+            let listHtml = items.map(item => {
+                let content = item.replace(/^ {0,4}(?:[-*+]|\d+\.) /, '');
+                return `<li>${content}</li>`;
+            }).join('');
+            return `${prefix}<${listType} style="text-align: left;">${listHtml}</${listType}>\n`;
+        });
+
+        // 11. Apply basic inline Markdown formatting safely on unshielded text
+        // Bold + Italic combinations: ***text*** or ___text___ -> <b><i>text</i></b>
+        html = html.replace(/\*\*\*(.*?)\*\*\*/g, "<b><i>$1</i></b>");
+        html = html.replace(/___(.*?)___/g, "<b><i>$1</i></b>");
+        html = html.replace(/\*\*_(.*?)_\*\*/g, "<b><i>$1</i></b>");
+        html = html.replace(/_\*\*(.*?)\*\*_/g, "<b><i>$1</i></b>");
+
+        // Bold: **text** or __text__ -> <b>text</b>
+        html = html.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+        html = html.replace(/__(.*?)__/g, "<b>$1</b>");
+
+        // Italic: *text* or _text_ -> <i>text</i>
+        html = html.replace(/\*(.*?)\*/g, "<i>$1</i>");
+        html = html.replace(/_(.*?)_/g, "<i>$1</i>");
+
+        // Highlight: ==text== -> <mark>text</mark>
+        html = html.replace(/==(.*?)==/g, "<mark>$1</mark>");
+
+        // Headers: e.g. # Header -> <h1>Header</h1>
+        html = html.replace(/^ {0,3}(#{1,6}) +(.*?)$/gm, (match, hashes, content) => {
+            const level = hashes.length;
+            return `<h${level}>${content}</h${level}>`;
+        });
+
+        // 12. Convert newlines to <br>
+        html = html.replace(/\r?\n/g, "<br>");
+
+        // 13. Restore all protected placeholders from end to start (safely avoiding special $ replacement tokens)
+        for (let i = placeholders.length - 1; i >= 0; i--) {
+            const ph = placeholders[i];
+            html = html.replace(ph.placeholder, () => ph.content);
+        }
+
+        // Rimuove eventuali <br> finali rimasti
+        html = html.replace(/(?:<br\s*\/?>)+$/i, "");
+
+        return html;
+    }
+
+    static escapeHtml(text) {
+        return text
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+}
+
+// =====================================================================================
+// 2. MODULAR FLASHCARD REPRESENTATIONS
+// =====================================================================================
+class Card {
+    constructor(id, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags, inserted, mediaNames) {
+        this.id = id;
+        this.deckName = deckName;
+        this.initialContent = initialContent;
+        this.fields = fields;
+        this.reversed = reversed;
+        this.initialOffset = initialOffset;
+        this.endOffset = endOffset;
+        this.tags = tags;
+        this.inserted = inserted;
+        this.mediaNames = mediaNames;
+        this.mediaBase64Encoded = [];
+        this.oldTags = [];
+        this.deletedFromAnki = false;
+        this.modelName = "";
+    }
+
+    match(ankiNote) {
+        for (let [name, value] of Object.entries(this.fields)) {
+            let ankiField = ankiNote.fields[name];
+            if (!ankiField) return false;
+            if (ankiField.value !== value) return false;
+        }
+        return this.arraysEqual(ankiNote.tags, this.tags);
+    }
+
+    arraysEqual(a, b) {
+        if (a === b) return true;
+        if (a == null || b == null || a.length !== b.length) return false;
+        a.sort();
+        b.sort();
+        for (let i = 0; i < a.length; ++i) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+}
+
+class MultilineCard extends Card {
+    constructor(id = -1, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags = [], inserted = false, mediaNames = [], settings) {
+        super(id, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags, inserted, mediaNames);
+        this.modelName = this.reversed ? settings.reversedModel : settings.basicModel;
+    }
+    getCard(includeId = false) {
+        let card = { deckName: this.deckName, modelName: this.modelName, fields: this.fields, tags: this.tags };
+        if (includeId) card.id = this.id;
+        return card;
+    }
+    getMedias() {
+        let medias = [];
+        this.mediaBase64Encoded.forEach((data, i) => {
+            medias.push({ filename: this.mediaNames[i], data: data });
+        });
+        return medias;
+    }
+    getIdFormat() {
+        return "<!--anki:" + this.id.toString() + "-->\n";
+    }
+}
+
+class InlineCard extends Card {
+    constructor(id = -1, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags = [], inserted = false, mediaNames = [], settings) {
+        super(id, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags, inserted, mediaNames);
+        this.modelName = this.reversed ? settings.reversedModel : settings.basicModel;
+    }
+    getCard(includeId = false) {
+        let card = { deckName: this.deckName, modelName: this.modelName, fields: this.fields, tags: this.tags };
+        if (includeId) card.id = this.id;
+        return card;
+    }
+    getMedias() {
+        let medias = [];
+        this.mediaBase64Encoded.forEach((data, i) => {
+            medias.push({ filename: this.mediaNames[i], data: data });
+        });
+        return medias;
+    }
+    getIdFormat() {
+        return "<!--anki:" + this.id.toString() + "-->";
+    }
+}
+
+class SpacedCard extends Card {
+    constructor(id = -1, deckName, initialContent, fields, reversed = false, initialOffset, endOffset, tags = [], inserted = false, mediaNames = [], settings) {
+        super(id, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags, inserted, mediaNames);
+        this.modelName = settings.spacedModel;
+    }
+    getCard(includeId = false) {
+        let card = { deckName: this.deckName, modelName: this.modelName, fields: this.fields, tags: this.tags };
+        if (includeId) card.id = this.id;
+        return card;
+    }
+    getMedias() {
+        let medias = [];
+        this.mediaBase64Encoded.forEach((data, i) => {
+            medias.push({ filename: this.mediaNames[i], data: data });
+        });
+        return medias;
+    }
+    getIdFormat() {
+        return "<!--anki:" + this.id.toString() + "-->\n";
+    }
+}
+
+class ClozeCard extends Card {
+    constructor(id = -1, deckName, initialContent, fields, reversed = false, initialOffset, endOffset, tags = [], inserted = false, mediaNames = [], settings) {
+        super(id, deckName, initialContent, fields, reversed, initialOffset, endOffset, tags, inserted, mediaNames);
+        this.modelName = settings.clozeModel;
+    }
+    getCard(includeId = false) {
+        let card = { deckName: this.deckName, modelName: this.modelName, fields: this.fields, tags: this.tags };
+        if (includeId) card.id = this.id;
+        return card;
+    }
+    getMedias() {
+        let medias = [];
+        this.mediaBase64Encoded.forEach((data, i) => {
+            medias.push({ filename: this.mediaNames[i], data: data });
+        });
+        return medias;
+    }
+    getIdFormat() {
+        return "\n<!--anki:" + this.id.toString() + "-->";
+    }
+}
+
+// =====================================================================================
+// 3. ANKI CONNECT CLIENT (Async/Fetch-Based API Wrapper)
+// =====================================================================================
+class AnkiClient {
+    constructor(url) {
+        this.url = url || "http://localhost:8765";
+    }
+
+    async invoke(action, version = 6, params = {}) {
+        try {
+            const response = await fetch(this.url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action, version, params })
+            });
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+            const data = await response.json();
+            if (Object.getOwnPropertyNames(data).length !== 2) throw new Error("Response format error");
+            if (!Object.prototype.hasOwnProperty.call(data, "error")) throw new Error("Missing error field");
+            if (!Object.prototype.hasOwnProperty.call(data, "result")) throw new Error("Missing result field");
+            if (data.error) throw new Error(data.error);
+            return data.result;
+        } catch (e) {
+            console.error(`AnkiClient action [${action}] failed:`, e);
+            throw e;
+        }
+    }
+
+    async ping() {
+        try {
+            const version = await this.invoke("version");
+            return version === 6;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    async requestPermission() {
+        return this.invoke("requestPermission");
+    }
+
+    async createDeck(deckName) {
+        return this.invoke("createDeck", 6, { deck: deckName });
+    }
+
+    async createModels(settings, forceResetCss = false) {
+        let models = this.getModels(settings);
+        let existingModels = [];
+        try {
+            existingModels = await this.invoke("modelNames");
+        } catch (e) {
+            console.error("Flashcards: Failed to retrieve model names from Anki", e);
+        }
+
+        let actions = [];
+        let scriptModels = [settings.basicModel, settings.reversedModel, settings.spacedModel, settings.clozeModel];
+
+        for (let m of models) {
+            let modelName = m.params.modelName;
+            if (!scriptModels.includes(modelName)) continue;
+
+            if (existingModels.includes(modelName)) {
+                // Allinea/migra modello esistente
+                try {
+                    let fields = await this.invoke("modelFieldNames", 6, { modelName: modelName });
+                    if (settings.sourceSupport && !fields.includes("Source")) {
+                        await this.invoke("modelFieldAdd", 6, { modelName: modelName, fieldName: "Source" });
+                    }
+
+                    let templatesObj = {};
+                    m.params.cardTemplates.forEach(t => {
+                        templatesObj[t.Name] = {
+                            Front: t.Front,
+                            Back: t.Back
+                        };
+                    });
+
+                    await this.invoke("updateModelTemplates", 6, {
+                        model: {
+                            name: modelName,
+                            templates: templatesObj
+                        }
+                    });
+
+                    if (forceResetCss) {
+                        await this.invoke("updateModelStyling", 6, {
+                            model: {
+                                name: modelName,
+                                css: m.params.css
+                            }
+                        });
+                    }
+                } catch (err) {
+                    console.error(`Flashcards: Failed to update/migrate model ${modelName}`, err);
+                }
+            } else {
+                // Crea da zero
+                actions.push(m);
+            }
+        }
+
+        if (actions.length > 0) {
+            return this.invoke("multi", 6, { actions: actions });
+        }
+        return {};
+    }
+
+    async storeMediaFiles(cards) {
+        let actions = [];
+        for (let c of cards) {
+            for (let m of c.getMedias()) {
+                actions.push({ action: "storeMediaFile", params: m });
+            }
+        }
+        if (actions.length > 0) {
+            return this.invoke("multi", 6, { actions: actions });
+        }
+        return {};
+    }
+
+    async addCards(cards) {
+        let actions = cards.map(c => ({ action: "addNote", params: { note: c.getCard(false) } }));
+        let res = await this.invoke("multi", 6, { actions: actions });
+        return res.map(r => (r && typeof r === "object" && "error" in r) ? (r.error ? null : r.result) : r);
+    }
+
+    async updateCards(cards) {
+        let actions = [];
+        let cardIds = [];
+        for (let c of cards) {
+            actions.push({ action: "updateNoteFields", params: { note: c.getCard(true) } });
+            actions = actions.concat(this.mergeTags(c.oldTags, c.tags, c.id));
+            cardIds.push(c.id);
+        }
+        if (cards.length > 0) {
+            actions.push({ action: "changeDeck", params: { cards: cardIds, deck: cards[0].deckName } });
+            return this.invoke("multi", 6, { actions: actions });
+        }
+    }
+
+    async changeDeck(cards, deckName) {
+        return this.invoke("changeDeck", 6, { cards: cards, deck: deckName });
+    }
+
+    async cardsInfo(cards) {
+        return this.invoke("cardsInfo", 6, { cards: cards });
+    }
+
+    async getCards(noteIds) {
+        return this.invoke("notesInfo", 6, { notes: noteIds });
+    }
+
+    async findNotes(query) {
+        return this.invoke("findNotes", 6, { query: query });
+    }
+
+    async deleteNotes(noteIds) {
+        return this.invoke("deleteNotes", 6, { notes: noteIds });
+    }
+
+    mergeTags(oldTags, newTags, noteId) {
+        let actions = [];
+        for (let t of newTags) {
+            let idx = oldTags.indexOf(t);
+            if (idx > -1) {
+                oldTags.splice(idx, 1);
+            } else {
+                actions.push({ action: "addTags", params: { notes: [noteId], tags: t } });
+            }
+        }
+        for (let t of oldTags) {
+            actions.push({ action: "removeTags", params: { notes: [noteId], tags: t } });
+        }
+        return actions;
+    }
+
+    getModels(settings) {
+        let sourceSupport = settings.sourceSupport;
+        let sourceFieldHtml = sourceSupport ? `\n\n{{#Source}}\n<br><br>\n<a href="{{Source}}" class="source-link" title="Source">\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-origami-icon lucide-origami"><path d="M12 12V4a1 1 0 0 1 1-1h6.297a1 1 0 0 1 .651 1.759l-4.696 4.025"/><path d="m12 21-7.414-7.414A2 2 0 0 1 4 12.172V6.415a1.002 1.002 0 0 1 1.707-.707L20 20.009"/><path d="m12.214 3.381 8.414 14.966a1 1 0 0 1-.167 1.199l-1.168 1.163a1 1 0 0 1-.706.291H6.351a1 1 0 0 1-.625-.219L3.25 18.8a1 1 0 0 1 .631-1.781l4.165.027"/></svg>\n</a>\n<script>\n    (function() {\n        var link = document.querySelector('.source-link');\n        if (link) {\n            var href = link.getAttribute('href');\n            if (href) {\n                var match = href.match(/[?&]file=([^&]+)/);\n                if (match) {\n                    var file = decodeURIComponent(match[1]);\n                    if (file.endsWith('.md')) {\n                        file = file.substring(0, file.length - 3);\n                    }\n                    var noteName = file.split('/').pop();\n                    link.setAttribute('title', noteName);\n                }\n            }\n        }\n    })();\n</script>\n{{/Source}}` : "";
+
+        let basicFields = ["Front", "Back"];
+        if (sourceSupport) basicFields.push("Source");
+        let spacedFields = ["Prompt"];
+        if (sourceSupport) spacedFields.push("Source");
+        let clozeFields = ["Text", "Extra"];
+        if (sourceSupport) clozeFields.push("Source");
+
+        let css = settings.customCss || `body {
+    background-color: #000000;
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+.card {
+    background-color: #000000;
+    color: #ffffff;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 22px;
+    text-align: center;
+    line-height: 1.6;
+    border: 1px solid #ffffff;
+    border-radius: 15px;
+    padding: 30px;
+    width: 80%;
+    max-width: 600px;
+    margin: auto;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 20px rgba(255, 255, 255, 0.15);
+}
+.source-link {
+    color: #a0a0a0;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    transition: color 0.35s, transform 0.35s;
+}
+.source-link:hover {
+    color: #3b82f6;
+    transform: scale(1.05);
+}
+b, strong {
+    color: #FF005E;
+    text-shadow: 0 0 8px rgba(255, 0, 94, 0.6), 0 0 15px rgba(255, 0, 94, 0.4);
+}
+i, em {
+    color: #5EFF00;
+    text-shadow: 0 0 8px rgba(94, 255, 0, 0.6), 0 0 15px rgba(94, 255, 0, 0.4);
+}
+b i, strong em, i b, em strong {
+    color: #005EFF;
+    text-shadow: 0 0 8px rgba(0, 94, 255, 0.6), 0 0 20px rgba(0, 94, 255, 0.5);
+}
+
+/* TTS */
+
+.solo-desktop, .solo-mobile {
+    display: none;
+}
+
+.desktop .solo-desktop {
+    display: block;
+}
+
+.mobile .solo-mobile {
+    display: block;
+}`;
+
+
+        let ObsidianBasic = {
+            action: "createModel",
+            params: {
+                modelName: settings.basicModel,
+                inOrderFields: basicFields,
+                css: css,
+                cardTemplates: [{
+                    Name: "Front / Back",
+                    Front: `{{Front}}\n{{tts it_IT speed=1.2:Front}}`,
+                    Back: `{{FrontSide}}\n<hr id=answer>\n{{Back}}${sourceFieldHtml}\n{{tts it_IT speed=1.2:Back}}`
+                }]
+            }
+        };
+        let ObsidianBasicReversed = {
+            action: "createModel",
+            params: {
+                modelName: settings.reversedModel,
+                inOrderFields: basicFields,
+                css: css,
+                cardTemplates: [{
+                    Name: "Front / Back",
+                    Front: `{{Front}}\n{{tts it_IT speed=1.2:Front}}`,
+                    Back: `{{FrontSide}}\n<hr id=answer>\n{{Back}}${sourceFieldHtml}\n{{tts it_IT speed=1.2:Back}}`
+                }, {
+                    Name: "Back / Front",
+                    Front: `{{Back}}\n{{tts it_IT speed=1.2:Back}}`,
+                    Back: `{{FrontSide}}\n<hr id=answer>\n{{Front}}${sourceFieldHtml}\n{{tts it_IT speed=1.2:Front}}`
+                }]
+            }
+        };
+        let ObsidianSpaced = {
+            action: "createModel",
+            params: {
+                modelName: settings.spacedModel,
+                inOrderFields: spacedFields,
+                css: css,
+                cardTemplates: [{
+                    Name: "Spaced",
+                    Front: `{{Prompt}}\n{{tts it_IT speed=1.2:Prompt}}`,
+                    Back: `{{FrontSide}}\n<hr id=answer>🧠 Review done.${sourceFieldHtml}`
+                }]
+            }
+        };
+        let ObsidianCloze = {
+            action: "createModel",
+            params: {
+                modelName: settings.clozeModel,
+                inOrderFields: clozeFields,
+                css: css,
+                isCloze: true,
+                cardTemplates: [{
+                    Name: "Cloze",
+                    Front: `{{cloze:Text}}\n{{tts it_IT speed=1.2:Text}}`,
+                    Back: `{{cloze:Text}}\n<br>{{Extra}}${sourceFieldHtml}\n{{tts it_IT speed=1.2:Text}}`
+                }]
+            }
+        };
+
+        return [ObsidianBasic, ObsidianBasicReversed, ObsidianSpaced, ObsidianCloze];
+    }
+}
+
+// =====================================================================================
+// 4. REGULAR EXPRESSION PARSING RULES
+// =====================================================================================
+class RegexRules {
+    constructor(settings) {
+        this.update(settings);
+    }
+
+    update(settings) {
+        this.headingsRegex = /^ {0,3}(#{1,6}) +([^\n]+?) ?((?: *#\S+)*) *$/gim;
+        this.wikiImageLinks = /!\[\[(.*\.(?:png|jpg|jpeg|gif|bmp|svg|tiff)).*?\]\]/gim;
+        this.markdownImageLinks = /!\[\]\((.*\.(?:png|jpg|jpeg|gif|bmp|svg|tiff))\)/gim;
+        this.wikiAudioLinks = /!\[\[(.*\.(?:mp3|webm|wav|m4a|ogg|3gp|flac)).*?\]\]/gim;
+        this.obsidianCodeBlock = /(?:```(?:.*?\n?)+?```)(?:\n|$)/gim;
+        this.codeBlock = /<code\b[^>]*>(.*?)<\/code>/gims;
+        this.mathBlock = /(\$\$)(.*?)(\$\$)/gis;
+        this.mathInline = /(\$)(.*?)(\$)/gi;
+        this.cardsDeckLine = /cards-deck: [\p{L}]+/giu;
+        this.cardsToDelete = /^\s*(?:\n)(?:(?:\^|<!--anki:)(\d{13})(?:-->)?)(?:\n\s*?)?/gm;
+        this.globalTagsSplitter = /\[\[(.*?)\]\]|#([\p{L}\d:\-_/]+)|([\p{L}\d:\-_/]+)/gimu;
+        this.tagHierarchy = /\//gm;
+
+        let flags = "gimu";
+        let cardTag = settings.flashcardsTag;
+
+        let multilinePattern = "( {0,3}[#]*)([^\\n]+?)(#" + cardTag + "(?:[/-]reverse)?)((?: *#[\\p{Number}\\p{Letter}\\-\\/_]+)*) *?\\n+((?:[^\\n]\\n?)*?(?=(?:\\^|<!--anki:)\\d{13}(?:-->)?|$))(?:(?:\\^|<!--anki:)(\\d{13})(?:-->)?)?";
+        this.flashscardsWithTag = new RegExp(multilinePattern, flags);
+
+        let m = settings.inlineSeparator.length >= settings.inlineSeparatorReverse.length ? settings.inlineSeparator : settings.inlineSeparatorReverse;
+        let a = settings.inlineSeparator.length < settings.inlineSeparatorReverse.length ? settings.inlineSeparator : settings.inlineSeparatorReverse;
+
+        let inlinePattern;
+        if (settings.inlineID) {
+            inlinePattern = "( {0,3}[#]{0,6})?(?:(?:[\\t ]*)(?:\\d+\\.|[-+*]|#{1,6})[\\t ])?(.+?) ?(" + m + "|" + a + ") ?(.+?)((?: *#[\\p{Letter}\\-\\/_]+)+)?(?:\\s+(?:\\^|<!--anki:)(\\d{13})(?:-->)?|$)"
+        } else {
+            inlinePattern = "( {0,3}[#]{0,6})?(?:(?:[\\t ]*)(?:\\d+\\.|[-+*]|#{1,6})[\\t ])?(.+?) ?(" + m + "|" + a + ") ?(.+?)((?: *#[\\p{Letter}\\-\\/_]+)+|$)(?:\\r?\\n(?:\\^|<!--anki:)(\\d{13})(?:-->)?)?"
+        }
+        this.cardsInlineStyle = new RegExp(inlinePattern, flags);
+
+        let spacedPattern = "( {0,3}[#]*)([^\\n]+?)(#" + cardTag + "[/-]spaced)((?: *#[\\p{Letter}-]+)*) *\\n?(?:(?:\\^|<!--anki:)(\\d{13})(?:-->)?)?";
+        this.cardsSpacedStyle = new RegExp(spacedPattern, flags);
+
+        let clozePattern = "( {0,3}[#]{0,6})?(?:(?:[\\t ]*)(?:\\d+\\.|[-+*]|#{1,6})[\\t ])?(.*?(==.+?==|\\{.+?\\}).*?)((?: *#[\\w\\-\\/_]+)+|$)(?:\\r?\\n(?:\\^|<!--anki:)(\\d{13})(?:-->)?)?";
+        this.cardsClozeWholeLine = new RegExp(clozePattern, flags);
+
+        this.singleClozeCurly = /((?:{)(?:[cC]?(\d):?)?(.+?)(?:}))/g;
+        this.singleClozeHighlight = /((?:==)(.+?)(?:==))/g;
+        this.embedBlock = /!\[\[(.*?)(?<!\.(?:png|jpg|jpeg|gif|bmp|svg|tiff|mp3|webm|wav|m4a|ogg|3gp|flac))\]\]/g;
+    }
+}
+
+// =====================================================================================
+// 5. REGEX-BASED CARD PARSER ENGINE
+// =====================================================================================
+class CardParser {
+    constructor(regex, settings) {
+        this.regex = regex;
+        this.settings = settings;
+    }
+
+    generateFlashcards(fileContent, deckName, vaultName, fileName, globalTags = []) {
+        let isContextAware = this.settings.contextAwareMode;
+        let cards = [];
+        let headings = Array.from(fileContent.matchAll(this.regex.headingsRegex));
+        let encVault = encodeURIComponent(vaultName);
+        let encFile = encodeURIComponent(fileName);
+        let fileSourceLink = `obsidian://open?vault=${encVault}&file=${encFile}.md`;
+
+        // 1. Create a masked copy of the file content to prevent false matches inside exclusion zones
+        let tempChars = Array.from(fileContent);
+
+        function maskRange(start, end) {
+            for (let i = start; i < end; i++) {
+                if (tempChars[i] !== '\n' && tempChars[i] !== '\r') {
+                    tempChars[i] = '\uFFFC';
+                }
+            }
+        }
+
+        // 0. Mask YAML Frontmatter
+        let yamlMatches = Array.from(fileContent.matchAll(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/g));
+        yamlMatches.forEach(b => maskRange(b.index, b.index + b[0].length));
+        let currentContent = tempChars.join("");
+
+        // A. Mask Fenced Code Blocks
+        let fencedMatches = Array.from(fileContent.matchAll(/(?:```(?:.*?\n?)+?```)(?:\n|$)/gim));
+        fencedMatches.forEach(b => maskRange(b.index, b.index + b[0].length));
+        currentContent = tempChars.join("");
+
+        // B. Mask Inline Code Blocks
+        let inlineCodeMatches = Array.from(currentContent.matchAll(/`([^`\n]+?)`/g));
+        inlineCodeMatches.forEach(b => maskRange(b.index, b.index + b[0].length));
+        currentContent = tempChars.join("");
+
+        // C. Mask Multiline Math Blocks
+        let mathBlockMatchesExact = Array.from(currentContent.matchAll(/\$\$(.*?)\$\$/gs));
+        mathBlockMatchesExact.forEach(b => maskRange(b.index, b.index + b[0].length));
+        currentContent = tempChars.join("");
+
+        // D. Mask Inline Math Blocks
+        let mathInlineMatches = Array.from(currentContent.matchAll(/\$(.*?)\$/g));
+        mathInlineMatches.forEach(b => maskRange(b.index, b.index + b[0].length));
+        currentContent = tempChars.join("");
+
+        // Now compute actual exclusion ranges for cloze & separator replacement callbacks
+        let codeBlocks = Array.from(fileContent.matchAll(/(?:```(?:.*?\n?)+?```)(?:\n|$)/gim));
+        let inlineCodes = Array.from(currentContent.matchAll(/`([^`\n]+?)`/g));
+        let mathBlocks = Array.from(currentContent.matchAll(/\$\$(.*?)\$\$/gs));
+        let mathInlines = Array.from(currentContent.matchAll(/\$(.*?)\$/g));
+        let yamlFrontmatter = Array.from(fileContent.matchAll(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/g));
+
+        let allExclusionBlocks = [...codeBlocks, ...inlineCodes, ...mathBlocks, ...mathInlines, ...yamlFrontmatter].map(b => [b.index, b.index + b[0].length]);
+
+        function isIndexExcluded(index) {
+            return allExclusionBlocks.some(eb => index >= eb[0] && index < eb[1]);
+        }
+
+        // 1. Spaced Cards
+        let spacedMatches = Array.from(currentContent.matchAll(this.regex.cardsSpacedStyle));
+        for (let m of spacedMatches) {
+            let tagIndex = m.index + m[0].indexOf(m[3]);
+            if (isIndexExcluded(tagIndex)) continue;
+
+            let indentLevel = m[1] ? (m[1].trim().length > 0 ? m[1].trim().length : -1) : -1;
+            let context = isContextAware ? this.getContext(headings, m.index - 1, indentLevel) : [];
+
+            let m2Start = m.index + m[0].indexOf(m[2]);
+            let rawFront = fileContent.substring(m2Start, m2Start + m[2].length).trim();
+            let finalFront = isContextAware ? [...context, rawFront].join(this.settings.contextSeparator) : rawFront;
+
+            let mediaNames = this.getImageLinks(finalFront).concat(this.getAudioLinks(finalFront));
+            finalFront = this.parseLine(finalFront, vaultName);
+
+            let cardTags = this.parseTags(m[4], globalTags);
+            let id = m[5] ? Number(m[5]) : -1;
+            let inserted = !!m[5];
+
+            let fields = { Prompt: finalFront };
+            if (this.settings.sourceSupport) fields.Source = fileSourceLink;
+
+            cards.push(new SpacedCard(id, deckName, rawFront, fields, false, m.index, m.index + m[0].length, cardTags, inserted, mediaNames, this.settings));
+        }
+
+        // 2. Cloze Cards
+        let clozeMatches = Array.from(currentContent.matchAll(this.regex.cardsClozeWholeLine));
+        for (let m of clozeMatches) {
+            let indentLevel = m[1] ? (m[1].trim().length > 0 ? m[1].trim().length : -1) : -1;
+            let context = isContextAware ? this.getContext(headings, m.index - 1, indentLevel) : [];
+
+            let m2Start = m.index + m[0].indexOf(m[2]);
+            let rawFront = fileContent.substring(m2Start, m2Start + m[2].length);
+
+            // Shield code blocks, inline code, and math blocks inside rawFront using placeholders
+            let placeholders = [];
+            let placeholderCounter = 0;
+            function store(block) {
+                const ph = `\uFFFCPLH${placeholderCounter++}\uFFFC`;
+                placeholders.push({ placeholder: ph, content: block });
+                return ph;
+            }
+
+            let maskedFront = rawFront;
+            maskedFront = maskedFront.replace(/(?:```(?:.*?\n?)+?```)(?:\n|$)/gim, store);
+            maskedFront = maskedFront.replace(/`([^`\n]+?)`/g, store);
+            maskedFront = maskedFront.replace(/\$\$(.*?)\$\$/gs, store);
+            maskedFront = maskedFront.replace(/\$(.*?)\$/g, store);
+
+            let withClozeText = maskedFront.replace(this.regex.singleClozeCurly, (full, brace, clozeIdx, value) => {
+                return clozeIdx ? `{{c${clozeIdx}::${value}}}` : `{{c1::${value}}}`;
+            });
+
+            withClozeText = withClozeText.replace(this.regex.singleClozeHighlight, (full, brace, value) => {
+                return `{{c1::${value}}}`;
+            });
+
+            // Restore shielded blocks
+            for (let i = placeholders.length - 1; i >= 0; i--) {
+                const ph = placeholders[i];
+                withClozeText = withClozeText.replace(ph.placeholder, () => ph.content);
+            }
+
+            if (withClozeText === rawFront) continue;
+
+            let rawFrontTrimmed = rawFront.trim();
+            let finalFront = isContextAware ? [...context, withClozeText.trim()].join(this.settings.contextSeparator) : withClozeText.trim();
+
+            let mediaNames = this.getImageLinks(finalFront).concat(this.getAudioLinks(finalFront));
+            finalFront = this.parseLine(finalFront, vaultName);
+
+            let cardTags = this.parseTags(m[4], globalTags);
+            let id = m[5] ? Number(m[5]) : -1;
+            let inserted = !!m[5];
+
+            let fields = { Text: finalFront, Extra: "" };
+            if (this.settings.sourceSupport) fields.Source = fileSourceLink;
+
+            cards.push(new ClozeCard(id, deckName, rawFrontTrimmed, fields, false, m.index, m.index + m[0].length, cardTags, inserted, mediaNames, this.settings));
+        }
+
+        // 3. Inline Cards
+        let inlineMatches = Array.from(currentContent.matchAll(this.regex.cardsInlineStyle));
+        for (let m of inlineMatches) {
+            if (m[2].toLowerCase().startsWith("cards-deck") || m[2].toLowerCase().startsWith("tags")) continue;
+
+            let separatorIndex = m.index + m[0].indexOf(m[3]);
+            if (isIndexExcluded(separatorIndex)) continue;
+
+            let isReversed = m[3] === this.settings.inlineSeparatorReverse;
+            let indentLevel = m[1] ? (m[1].trim().length > 0 ? m[1].trim().length : -1) : -1;
+            let context = isContextAware ? this.getContext(headings, m.index - 1, indentLevel) : [];
+
+            let m2Start = m.index + m[0].indexOf(m[2]);
+            let rawFront = fileContent.substring(m2Start, m2Start + m[2].length).trim();
+            let finalFront = isContextAware ? [...context, rawFront].join(this.settings.contextSeparator) : rawFront;
+
+            let m4Start = m.index + m[0].indexOf(m[4]);
+            let rawBack = fileContent.substring(m4Start, m4Start + m[4].length).trim();
+
+            let mediaNames = this.getImageLinks(finalFront).concat(this.getImageLinks(rawBack)).concat(this.getAudioLinks(rawBack));
+            finalFront = this.parseLine(finalFront, vaultName);
+            let finalBack = this.parseLine(rawBack, vaultName);
+
+            let cardTags = this.parseTags(m[5], globalTags);
+            let id = m[6] ? Number(m[6]) : -1;
+            let inserted = !!m[6];
+
+            let fields = { Front: finalFront, Back: finalBack };
+            if (this.settings.sourceSupport) fields.Source = fileSourceLink;
+
+            cards.push(new InlineCard(id, deckName, rawFront, fields, isReversed, m.index, m.index + m[0].length, cardTags, inserted, mediaNames, this.settings));
+        }
+
+        // 4. Multiline tagged cards (#card)
+        let tagMatches = Array.from(currentContent.matchAll(this.regex.flashscardsWithTag));
+        for (let m of tagMatches) {
+            let tagIndex = m.index + m[0].indexOf(m[3]);
+            if (isIndexExcluded(tagIndex)) continue;
+
+            let isReversed = m[3].trim().toLowerCase() === `#${this.settings.flashcardsTag}-reverse` || m[3].trim().toLowerCase() === `#${this.settings.flashcardsTag}/reverse`;
+            let indentLevel = m[1].trim().length > 0 ? m[1].length : -1;
+            let context = isContextAware ? this.getContext(headings, m.index - 1, indentLevel) : [];
+
+            let m2Start = m.index + m[0].indexOf(m[2]);
+            let rawFrontLine = fileContent.substring(m2Start, m2Start + m[2].length).trim();
+            // If multilineCards is enabled, extend rawFront backward to include preceding non-empty lines
+            let rawFront = this.settings.multilineCards
+                ? this.getMultilineFront(fileContent, m.index, rawFrontLine)
+                : rawFrontLine;
+            let finalFront = isContextAware ? [...context, rawFront].join(this.settings.contextSeparator) : rawFront;
+
+            let m5Start = m.index + m[0].indexOf(m[5]);
+            let rawBack = fileContent.substring(m5Start, m5Start + m[5].length).trim();
+
+            let mediaNames = this.getImageLinks(finalFront).concat(this.getImageLinks(rawBack)).concat(this.getAudioLinks(rawBack));
+            finalFront = this.parseLine(finalFront, vaultName);
+            rawBack = this.parseLine(rawBack, vaultName);
+
+            let cardTags = this.parseTags(m[4], globalTags);
+            let id = m[6] ? Number(m[6]) : -1;
+            let inserted = !!m[6];
+
+            let fields = { Front: finalFront, Back: rawBack };
+            if (this.settings.sourceSupport) fields.Source = fileSourceLink;
+
+            cards.push(new MultilineCard(id, deckName, rawFront, fields, isReversed, m.index, m.index + m[0].length, cardTags, inserted, mediaNames, this.settings));
+        }
+
+        cards.sort((a, b) => a.endOffset - b.endOffset);
+
+        let defaultTag = this.settings.defaultAnkiTag;
+        if (defaultTag) {
+            for (let c of cards) {
+                if (!c.tags.includes(defaultTag)) c.tags.push(defaultTag);
+            }
+        }
+
+        return cards;
+    }
+
+    getContext(headings, activeIndex, indentLevel) {
+        let context = [];
+        let currentLevel = 7;
+
+        for (let i = headings.length - 1; i >= 0; i--) {
+            let h = headings[i];
+            if (h.index < activeIndex) {
+                let level = h[1].length;
+                if (level < currentLevel) {
+                    context.unshift(h[2].trim());
+                    currentLevel = level;
+                    activeIndex = h.index;
+                }
+            }
+        }
+        return context;
+    }
+
+    parseLine(text, vaultName) {
+        return MDFormatter.makeHtml(text, vaultName);
+    }
+
+    getImageLinks(text) {
+        let i = text.matchAll(this.regex.wikiImageLinks);
+        let g = text.matchAll(this.regex.markdownImageLinks);
+        let matches = [];
+        for (let m of i) matches.push(m[1]);
+        for (let m of g) matches.push(decodeURIComponent(m[1]));
+        return matches;
+    }
+
+    getAudioLinks(text) {
+        let i = text.matchAll(this.regex.wikiAudioLinks);
+        let matches = [];
+        for (let m of i) matches.push(m[1]);
+        return matches;
+    }
+
+    parseTags(tagString, globalTags) {
+        let tags = [...globalTags];
+        if (tagString) {
+            for (let t of tagString.split("#")) {
+                let trimmed = t.trim();
+                if (trimmed) {
+                    trimmed = trimmed.replace(this.regex.tagHierarchy, "::");
+                    if (!tags.includes(trimmed)) tags.push(trimmed);
+                }
+            }
+        }
+        return tags;
+    }
+
+    getAnkiIDsBlocks(fileContent) {
+        return Array.from(fileContent.matchAll(/(?:\^|<!--anki:)(\d{13})(?:-->)?/gm));
+    }
+
+    getCardsToDelete(fileContent) {
+        return Array.from(fileContent.matchAll(this.regex.cardsToDelete)).map(m => Number(m[1]));
+    }
+
+    // When multilineFront is enabled, scan backward from the #card match position
+    // to collect all consecutive non-empty lines above it (until an empty line,
+    // YAML frontmatter boundary, Anki ID block, or another card tag is found).
+    getMultilineFront(fileContent, cardMatchIndex, singleLineFront) {
+        let lines = [singleLineFront];
+        let pos = cardMatchIndex - 1;
+
+        // Skip newlines immediately before the matched card line
+        while (pos >= 0 && (fileContent[pos] === '\n' || fileContent[pos] === '\r')) {
+            pos--;
+        }
+
+        while (pos >= 0) {
+            // Find the start of the preceding line by scanning backward
+            let lineEnd = pos;
+            while (pos >= 0 && fileContent[pos] !== '\n') {
+                pos--;
+            }
+            let lineStart = pos + 1;
+            let line = fileContent.substring(lineStart, lineEnd + 1).trim();
+
+            // Stop at: empty lines, YAML frontmatter boundary, Anki ID blocks, another card tag
+            if (line === '' || line === '---') break;
+            if (/<!--anki:\d{13}-->/.test(line) || /\^\d{13}/.test(line)) break;
+            if (new RegExp('#' + this.settings.flashcardsTag + '(?:[\\/-]\\S+)?\\s*$').test(line)) break;
+
+            lines.unshift(line);
+            pos--; // move past the \n
+        }
+
+        return lines.join('\n');
+    }
+}
+
+// =====================================================================================
+// 6. CORE SYNCHRONIZATION PIPELINE ENGINE
+// =====================================================================================
+class CardsService {
+    constructor(app, settings) {
+        this.app = app;
+        this.settings = settings;
+        this.regex = new RegexRules(this.settings);
+        this.parser = new CardParser(this.regex, this.settings);
+        this.anki = new AnkiClient(this.settings.ankiConnectUrl);
+    }
+
+    async execute(file) {
+        this.regex.update(this.settings);
+        try {
+            await this.anki.ping();
+        } catch (e) {
+            console.error("Flashcards Connection Error:", e);
+            return ["Error: Anki must be open with AnkiConnect installed."];
+        }
+
+        this.updateFile = false;
+        this.totalOffset = 0;
+        this.notifications = [];
+
+        const fileName = file.basename;
+        const filePath = file.path;
+        const metadata = this.app.metadataCache.getFileCache(file);
+        const vaultName = this.app.vault.getName();
+        const frontmatter = metadata ? metadata.frontmatter : null;
+        this.frontmatterPosition = metadata ? metadata.frontmatterPosition : null;
+
+        let deckName = "";
+
+        if (parseFME(frontmatter, "cards-deck")) {
+            deckName = parseFME(frontmatter, "cards-deck");
+        } else if (this.settings.folderBasedDeck && file.parent && file.parent.path !== "/" && file.parent.path !== "") {
+            deckName = file.parent.path.split("/").join("::");
+        } else {
+            deckName = this.settings.deck;
+        }
+
+        try {
+            await this.anki.createModels(this.settings);
+            
+            // Sync Model IDs and fields into DNA per il Plugin Mobile
+            try {
+                let modelsAndIds = await this.anki.invoke("modelNamesAndIds");
+                let modelsDna = {};
+                let targetModels = [this.settings.basicModel, this.settings.reversedModel, this.settings.clozeModel, this.settings.spacedModel];
+                for (let modelName of targetModels) {
+                    if (modelsAndIds[modelName]) {
+                        let mid = modelsAndIds[modelName];
+                        let fields = await this.anki.invoke("modelFieldNames", 6, { modelName: modelName });
+                        modelsDna[mid.toString()] = {
+                            id: mid,
+                            name: modelName,
+                            flds: fields.map(f => ({ name: f }))
+                        };
+                    }
+                }
+                if (Object.keys(modelsDna).length > 0) {
+                    if (!this.settings.ankiModelsDna) this.settings.ankiModelsDna = {};
+                    for (let mid in modelsDna) {
+                        let newModel = modelsDna[mid];
+                        let existingModel = this.settings.ankiModelsDna[mid];
+                        if (existingModel) {
+                            existingModel.id = newModel.id;
+                            existingModel.name = newModel.name;
+                            existingModel.flds = newModel.flds;
+                        } else {
+                            // Rimuovi vecchie versioni dello stesso modello se l'ID è cambiato
+                            for (let oldMid in this.settings.ankiModelsDna) {
+                                if (this.settings.ankiModelsDna[oldMid].name === newModel.name) {
+                                    delete this.settings.ankiModelsDna[oldMid];
+                                }
+                            }
+                            this.settings.ankiModelsDna[mid] = newModel;
+                        }
+                    }
+                    let pluginInstance = this.app.plugins.getPlugin("flashcards-extended");
+                    if (pluginInstance) {
+                        await pluginInstance.saveSettings();
+                    }
+                }
+            } catch (e) {
+                console.error("Flashcards: Failed to fetch model IDs for DNA sync", e);
+            }
+
+            await this.anki.createDeck(deckName);
+
+            this.file = await this.app.vault.read(file);
+            if (!this.file.endsWith("\n")) {
+                this.file += "\n";
+            }
+
+            let globalTags = this.parseGlobalTags(this.file, file);
+            if (this.settings.folderBasedTag && file.parent && file.parent.path !== "/" && file.parent.path !== "") {
+                let folderTag = file.parent.path.split("/").join("::").replace(/ /g, "-");
+                if (folderTag && !globalTags.includes(folderTag)) {
+                    globalTags.push(folderTag);
+                }
+            }
+            let idBlocksInFile = this.parser.getAnkiIDsBlocks(this.file);
+            let parsedIds = idBlocksInFile.map(b => Number(b[1]));
+
+            let ankiNotes = idBlocksInFile.length > 0 ? await this.anki.getCards(parsedIds) : [];
+            let currentCards = this.parser.generateFlashcards(this.file, deckName, vaultName, fileName, globalTags);
+
+            let [newCards, updateCards, orphanCards] = await this.filterByUpdate(ankiNotes, currentCards);
+
+            let cardsToUploadMedia = [...newCards, ...updateCards];
+            if (cardsToUploadMedia.length > 0) {
+                await this.insertMedias(cardsToUploadMedia, filePath);
+            }
+
+            if (newCards.length > 0) {
+                for (let nc of newCards) {
+                    if (nc.deletedFromAnki) {
+                        let oldIdStr = nc.id.toString();
+                        let match = idBlocksInFile.find(m => m[1] === oldIdStr);
+                        if (match) {
+                            nc.oldIdMatch = match;
+                        }
+                    }
+                }
+            }
+
+            let noteIdsForDeckCheck = this.getCardsIds(ankiNotes, currentCards);
+            let fileCardsToDelete = this.parser.getCardsToDelete(this.file);
+
+            await this.deleteCardsOnAnki(fileCardsToDelete, idBlocksInFile);
+            await this.updateCardsOnAnki(updateCards);
+            await this.insertCardsOnAnki(newCards, frontmatter, deckName);
+
+            if (noteIdsForDeckCheck.length > 0) {
+                let deckChanged = await this.deckNeedToBeChanged(noteIdsForDeckCheck, deckName);
+                if (deckChanged) {
+                    try {
+                        await this.anki.changeDeck(noteIdsForDeckCheck, deckName);
+                        this.notifications.push("Cards moved to the new deck.");
+                    } catch (e) {
+                        return ["Error: Could not update deck of the cards."];
+                    }
+                }
+            }
+
+            if (this.updateFile) {
+                try {
+                    await this.app.vault.modify(file, this.file);
+                } catch (e) {
+                    return ["Error: Could not update the file."];
+                }
+            }
+
+            if (this.notifications.length === 0) {
+                this.notifications.push(`Nothing to do. File: ${file.path} - Cards matched: ${currentCards.length}`);
+            }
+            return this.notifications;
+
+        } catch (e) {
+            console.error("Flashcards Sync pipeline crash:", e);
+            return ["Error: " + e.message];
+        }
+    }
+
+    async filterByUpdate(ankiNotes, currentCards) {
+        let newCards = [];
+        let updateCards = [];
+        let orphanCards = [];
+
+        for (let c of currentCards) {
+            let recoveredNote = null;
+            let wasInserted = c.inserted;
+
+            if (c.inserted && ankiNotes && ankiNotes.length > 0) {
+                let matchingNote = ankiNotes.filter(n => n && n.noteId && Number(n.noteId) === c.id)[0];
+                if (matchingNote && matchingNote.noteId) {
+                    if (!c.match(matchingNote)) {
+                        c.oldTags = matchingNote.tags;
+                        updateCards.push(c);
+                    }
+                    continue;
+                } else {
+                    // Wrong ID or deleted from Anki, let's try to recover by Front
+                    recoveredNote = await this.recoverNoteByFront(c);
+                }
+            } else {
+                // ID is deleted/missing in markdown entirely! Let's check if we can recover by Front!
+                recoveredNote = await this.recoverNoteByFront(c);
+            }
+
+            if (recoveredNote === "multiple") {
+                let frontRaw = this.getFrontTextRaw(c);
+                new Notice(`ATTENZIONE: Trovate più carte con lo stesso Front su Anki per: "${frontRaw}". Sincronizzazione saltata. Modifica Anki per avere un solo match.`, 10000);
+                this.notifications.push(`Warning: Multiple matches in Anki for Front: "${frontRaw}". Card ignored.`);
+            } else if (recoveredNote) {
+                let oldIdStr = c.id.toString();
+                let newId = Number(recoveredNote.noteId);
+                c.id = newId;
+
+                if (wasInserted) {
+                    // Scenario B: modified/wrong ID in file
+                    let idBlocksInFile = this.parser.getAnkiIDsBlocks(this.file);
+                    let match = idBlocksInFile.find(m => m[1] === oldIdStr);
+                    if (match) {
+                        let newIdStr = newId.toString();
+                        let oldIdBlock = match[0];
+                        let newIdBlock = oldIdBlock.replace(oldIdStr, newIdStr);
+                        this.file = this.file.substring(0, match.index + this.totalOffset) + newIdBlock + this.file.substring(match.index + oldIdBlock.length + this.totalOffset);
+                        this.totalOffset += (newIdBlock.length - oldIdBlock.length);
+                        this.updateFile = true;
+                    }
+                } else {
+                    // Missing ID in file entirely! We recovered it, so we append the new ID block!
+                    let idFormat = c.getIdFormat();
+                    let startIndex = c.endOffset + this.totalOffset;
+                    let newText = "";
+                    if (c instanceof InlineCard) {
+                        this.settings.inlineID ? newText = " " + idFormat : newText = "\n" + idFormat;
+                    } else {
+                        newText = idFormat;
+                    }
+                    this.file = this.file.substring(0, startIndex) + newText + this.file.substring(startIndex);
+                    this.totalOffset += newText.length;
+                    this.updateFile = true;
+
+                    // Mark as inserted now that we've written the block to the file
+                    c.inserted = true;
+                }
+
+                let frontRaw = this.getFrontTextRaw(c);
+                new Notice(`ID recuperato da Anki per: "${frontRaw}". ID aggiornato: ${newId}`, 8000);
+                this.notifications.push(`Recovered ID from Anki: ${newId} for Front: "${frontRaw}"`);
+
+                if (!c.match(recoveredNote)) {
+                    c.oldTags = recoveredNote.tags;
+                    updateCards.push(c);
+                }
+            } else {
+                if (wasInserted) {
+                    c.inserted = false;
+                    c.deletedFromAnki = true;
+                }
+                newCards.push(c);
+            }
+        }
+        return [newCards, updateCards, orphanCards];
+    }
+
+    getAnkiSearchQuery(card, useFallback = false) {
+        let fieldName = "";
+        let fieldValue = "";
+        if (card.fields.Front !== undefined) {
+            fieldName = "Front";
+            fieldValue = card.fields.Front;
+        } else if (card.fields.Prompt !== undefined) {
+            fieldName = "Prompt";
+            fieldValue = card.fields.Prompt;
+        } else if (card.fields.Text !== undefined) {
+            fieldName = "Text";
+            fieldValue = card.fields.Text;
+        } else {
+            return "";
+        }
+
+        let cleaned = "";
+        if (useFallback) {
+            let firstLine = fieldValue.split(/<br\s*\/?>|[\r\n]+/)[0];
+            cleaned = firstLine.replace(/<[^>]*>/g, " ").trim();
+            if (cleaned.length > 120) {
+                cleaned = cleaned.substring(0, 120);
+            }
+            cleaned = cleaned.replace(/[\r\n\s]+/g, "*").replace(/\*+/g, "*").trim();
+        } else {
+            cleaned = fieldValue.replace(/<[^>]*>/g, "*")
+                .replace(/[\r\n\s]+/g, "*")
+                .replace(/\*+/g, "*")
+                .trim();
+        }
+
+        cleaned = cleaned.replace(/^\*+|\*+$/g, "");
+        if (!cleaned) return "";
+
+        let escaped = cleaned.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        return `${fieldName}:"*${escaped}*"`;
+    }
+
+    getFrontTextRaw(card) {
+        let val = "";
+        if (card.fields.Front !== undefined) val = card.fields.Front;
+        else if (card.fields.Prompt !== undefined) val = card.fields.Prompt;
+        else if (card.fields.Text !== undefined) val = card.fields.Text;
+        return val.replace(/<[^>]*>/g, "").trim();
+    }
+
+    async recoverNoteByFront(card) {
+        let query = this.getAnkiSearchQuery(card, false);
+        if (!query) return null;
+        try {
+            let matches = await this.anki.findNotes(query);
+            if (matches && matches.length === 1) {
+                let notes = await this.anki.getCards([matches[0]]);
+                if (notes && notes.length === 1) {
+                    return notes[0];
+                }
+            } else if (matches && matches.length > 1) {
+                return "multiple";
+            }
+
+            let fallbackQuery = this.getAnkiSearchQuery(card, true);
+            if (fallbackQuery && fallbackQuery !== query) {
+                let fallbackMatches = await this.anki.findNotes(fallbackQuery);
+                if (fallbackMatches && fallbackMatches.length === 1) {
+                    let notes = await this.anki.getCards([fallbackMatches[0]]);
+                    if (notes && notes.length === 1) {
+                        return notes[0];
+                    }
+                } else if (fallbackMatches && fallbackMatches.length > 1) {
+                    return "multiple";
+                }
+            }
+        } catch (e) {
+            console.error("Error in recoverNoteByFront:", e);
+        }
+        return null;
+    }
+
+    async generateMediaLinks(cards, filePath) {
+        for (let c of cards) {
+            for (let m of c.mediaNames) {
+                let file = this.app.metadataCache.getFirstLinkpathDest(decodeURIComponent(m), filePath);
+                if (file) {
+                    try {
+                        let content = await this.app.vault.readBinary(file);
+                        c.mediaBase64Encoded.push(arrayBufferToBase64(content));
+                    } catch (e) {
+                        console.error(`Flashcards: Could not read media file ${m}:`, e);
+                    }
+                }
+            }
+        }
+    }
+
+    async insertMedias(cards, filePath) {
+        try {
+            await this.generateMediaLinks(cards, filePath);
+            await this.anki.storeMediaFiles(cards);
+        } catch (e) {
+            console.error("Flashcards: Could not upload media files to Anki:", e);
+        }
+    }
+
+    async updateCardsOnAnki(cards) {
+        if (cards.length > 0) {
+            try {
+                await this.anki.updateCards(cards);
+                this.notifications.push(`Updated successfully ${cards.length}/${cards.length} cards.`);
+            } catch (e) {
+                console.error("Flashcards: Could not update cards on Anki:", e);
+                throw new Error("Error: Could not update cards on Anki");
+            }
+        }
+    }
+
+    async deleteCardsOnAnki(noteIdsToDelete, idBlocksInFile) {
+        if (noteIdsToDelete.length > 0) {
+            let successCount = 0;
+            for (let match of idBlocksInFile) {
+                let id = Number(match[1]);
+                if (noteIdsToDelete.includes(id)) {
+                    try {
+                        await this.anki.deleteNotes([id]);
+                        successCount++;
+                        this.updateFile = true;
+
+                        this.file = this.file.substring(0, match.index) + this.file.substring(match.index + match[0].length, this.file.length);
+                        this.totalOffset -= match[0].length;
+                        this.notifications.push(`Deleted successfully ${successCount}/${noteIdsToDelete.length} cards.`);
+                    } catch (e) {
+                        console.error("Flashcards: Could not delete card from Anki:", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async insertCardsOnAnki(cards, frontmatter, deckName) {
+        if (cards.length > 0) {
+            let successCount = 0;
+            let failedCount = 0;
+            let totalExpectedCount = 0;
+
+            try {
+                let addResults = await this.anki.addCards(cards);
+                addResults.forEach((newId, index) => {
+                    cards[index].id = newId;
+                });
+
+                cards.forEach(c => {
+                    if (c.id === null) {
+                        failedCount++;
+                    } else {
+                        successCount += c.reversed ? 2 : 1;
+                        totalExpectedCount += c.reversed ? 2 : 1;
+                    }
+                });
+
+                if (failedCount > 0) {
+                    new Notice(`Skipped ${failedCount} duplicate/failed cards.`, 5000);
+                }
+
+                this.updateFrontmatter(frontmatter, deckName);
+                this.writeAnkiBlocks(cards);
+
+                this.notifications.push(`Inserted successfully ${successCount}/${totalExpectedCount} cards.${failedCount > 0 ? ` (Skipped ${failedCount})` : ""}`);
+                return successCount;
+            } catch (e) {
+                console.error("Flashcards: Could not write cards on Anki:", e);
+                this.notifications.push("Error: Could not write cards on Anki: " + (e.message || e.toString()));
+            }
+        }
+    }
+
+    updateFrontmatter(frontmatter, deckName) {
+        let deckLine = `cards-deck: ${deckName}\n`;
+        let fullFrontmatter = "";
+
+        if (frontmatter) {
+            let position = this.frontmatterPosition || frontmatter.position;
+            let rawFM = this.file.substring(position.start.offset, position.end.offset);
+
+            if (!rawFM.match(this.regex.cardsDeckLine)) {
+                fullFrontmatter = rawFM.substring(0, rawFM.length - 3) + deckLine + "---";
+                this.totalOffset += deckLine.length;
+                this.file = fullFrontmatter + this.file.substring(position.end.offset, this.file.length);
+            }
+        } else {
+            fullFrontmatter = `---\n${deckLine}---\n\n`;
+            this.totalOffset += fullFrontmatter.length;
+            this.file = fullFrontmatter + this.file;
+        }
+    }
+
+    writeAnkiBlocks(cards) {
+        let ops = [];
+        let frontmatterShift = this.totalOffset;
+
+        for (let c of cards) {
+            if (c.id !== null && !c.inserted) {
+                let startIndex, endIndex, newText;
+                if (c.oldIdMatch) {
+                    startIndex = c.oldIdMatch.index + frontmatterShift;
+                    endIndex = c.oldIdMatch.index + c.oldIdMatch[0].length + frontmatterShift;
+                    newText = "<!--anki:" + c.id.toString() + "-->";
+                } else {
+                    let idFormat = c.getIdFormat();
+                    startIndex = c.endOffset + frontmatterShift;
+                    endIndex = c.endOffset + frontmatterShift;
+
+                    if (c instanceof InlineCard) {
+                        this.settings.inlineID ? newText = " " + idFormat : newText = "\n" + idFormat;
+                    } else {
+                        newText = idFormat;
+                    }
+                }
+                ops.push({ startIndex, endIndex, newText });
+            }
+        }
+
+        ops.sort((a, b) => b.startIndex - a.startIndex);
+        for (let op of ops) {
+            this.file = this.file.substring(0, op.startIndex) + op.newText + this.file.substring(op.endIndex);
+        }
+        if (ops.length > 0) {
+            this.updateFile = true;
+        }
+    }
+
+    async deckNeedToBeChanged(noteIds, deckName) {
+        try {
+            let cards = await this.anki.cardsInfo(noteIds);
+            if (cards && cards.length > 0) {
+                return cards[0].deckName !== deckName;
+            }
+        } catch (e) {
+            console.error("Flashcards: deckNeedToBeChanged error:", e);
+        }
+        return false;
+    }
+
+    getCardsIds(ankiNotes, currentCards) {
+        let ids = [];
+        if (ankiNotes) {
+            for (let c of currentCards) {
+                if (c.inserted) {
+                    let match = ankiNotes.filter(n => Number(n.noteId) === c.id)[0];
+                    if (match && match.cards) {
+                        ids = ids.concat(match.cards);
+                    }
+                }
+            }
+        }
+        return ids;
+    }
+
+    parseGlobalTags(fileContent, file) {
+        let tags = [];
+        if (file && this.app && this.app.metadataCache) {
+            const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+            if (frontmatter) {
+                const cardsTags = frontmatter["cards-tags"];
+                if (cardsTags) {
+                    let rawList = [];
+                    if (Array.isArray(cardsTags)) {
+                        rawList = cardsTags;
+                    } else if (typeof cardsTags === "string") {
+                        rawList = cardsTags.split(/[,\s]+/).filter(Boolean);
+                    }
+
+                    for (let t of rawList) {
+                        let clean = t.toString()
+                            .replace("#", "")
+                            .replace(/\//g, "::")
+                            .replace(/\[\[(.*)\]\]/, "$1")
+                            .trim()
+                            .replace(/ /g, "-");
+                        if (clean && !tags.includes(clean)) {
+                            tags.push(clean);
+                        }
+                    }
+                    return tags;
+                }
+            }
+        }
+
+        // Fallback to manual parsing if file/metadataCache is not available (only for cards-tags!)
+        let match = fileContent.match(/cards-tags: ?(.*)/im);
+        if (match) {
+            let yamlRest = fileContent.substring(match.index + match[0].length);
+            let listLines = [];
+            if (match[1].trim().startsWith("[")) {
+                let inlineMatch = match[1].match(/\[(.*?)\]/);
+                if (inlineMatch) {
+                    listLines = inlineMatch[1].split(/[,\s]+/).filter(Boolean);
+                }
+            } else if (match[1].trim()) {
+                listLines = match[1].split(/[,\s]+/).filter(Boolean);
+            } else {
+                let lines = yamlRest.split(/\r?\n/);
+                for (let line of lines) {
+                    if (line.trim().startsWith("-")) {
+                        listLines.push(line.replace(/^\s*-\s*/, "").trim());
+                    } else if (line.trim() === "" || line.includes(":") || line.trim() === "---") {
+                        break;
+                    }
+                }
+            }
+
+            for (let t of listLines) {
+                let clean = t.replace("#", "")
+                    .replace(/\//g, "::")
+                    .replace(/\[\[(.*)\]\]/, "$1")
+                    .trim()
+                    .replace(/ /g, "-");
+                if (clean && !tags.includes(clean)) {
+                    tags.push(clean);
+                }
+            }
+        }
+        return tags;
+    }
+}
+
+// =====================================================================================
+// 7. SETTINGS PAGE USER INTERFACE
+// =====================================================================================
+class FlashcardsSettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display() {
+        let { containerEl } = this;
+        containerEl.empty();
+        containerEl.createEl("h1", { text: "Flashcards Extended - Settings" });
+
+        new Setting(containerEl)
+            .setName("Give Permission")
+            .setDesc("Open Anki on your desktop and click this button to grant access permissions.")
+            .addButton(btn => {
+                btn.setButtonText("Grant Permission").onClick(() => {
+                    let client = new AnkiClient(this.plugin.settings.ankiConnectUrl);
+                    client.requestPermission()
+                        .then(res => {
+                            if (res.permission === "granted") {
+                                this.plugin.settings.ankiConnectPermission = true;
+                                this.plugin.saveSettings();
+                                new Notice("AnkiConnect permission granted!");
+                            } else {
+                                new Notice("Permission denied by Anki Connect.");
+                            }
+                        })
+                        .catch(err => {
+                            new Notice("Error: Make sure Anki is running on your desktop with AnkiConnect enabled!");
+                            console.error(err);
+                        });
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Test Connection")
+            .setDesc("Test if Obsidian can successfully communicate with Anki.")
+            .addButton(btn => {
+                btn.setButtonText("Test").onClick(() => {
+                    let client = new AnkiClient(this.plugin.settings.ankiConnectUrl);
+                    client.ping()
+                        .then(success => {
+                            if (success) new Notice("Connection successful! Anki is connected. ⚡");
+                            else new Notice("Failed to connect. Make sure Anki is open!");
+                        })
+                        .catch(() => new Notice("Failed to connect. Make sure Anki is open!"));
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("AnkiConnect URL")
+            .setDesc("The local API URL of AnkiConnect.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.ankiConnectUrl)
+                    .setPlaceholder("http://localhost:8765")
+                    .onChange(val => {
+                        this.plugin.settings.ankiConnectUrl = val.trim();
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        containerEl.createEl("h2", { text: "Card Customization" });
+
+        new Setting(containerEl)
+            .setName("Multiline Cards")
+            .setDesc("When enabled, both the front and back of #card flashcards can span multiple lines. Preceding non-empty lines above the tag are included in the front, and subsequent lines become the back. Disabled by default.")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.multilineCards)
+                    .onChange(val => {
+                        this.plugin.settings.multilineCards = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Flashcards #tag")
+            .setDesc("Tag used to identify multiline and spaced flashcards (case-insensitive, default: card).")
+            .addText(text => {
+                text.setValue(this.plugin.settings.flashcardsTag)
+                    .setPlaceholder("card")
+                    .onChange(val => {
+                        if (val.trim()) {
+                            this.plugin.settings.flashcardsTag = val.trim().toLowerCase();
+                            this.plugin.saveSettings();
+                        } else {
+                            new Notice("Tag cannot be empty.");
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Inline Card Separator")
+            .setDesc("Separator used for inline flashcards (default: ::).")
+            .addText(text => {
+                text.setValue(this.plugin.settings.inlineSeparator)
+                    .setPlaceholder("::")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean && clean !== this.plugin.settings.inlineSeparatorReverse) {
+                            this.plugin.settings.inlineSeparator = clean;
+                            this.plugin.saveSettings();
+                        } else {
+                            new Notice("Invalid separator or matches reverse separator.");
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Inline Reverse Card Separator")
+            .setDesc("Separator used for bidirectionally reversed inline flashcards (default: :::).")
+            .addText(text => {
+                text.setValue(this.plugin.settings.inlineSeparatorReverse)
+                    .setPlaceholder(":::")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean && clean !== this.plugin.settings.inlineSeparator) {
+                            this.plugin.settings.inlineSeparatorReverse = clean;
+                            this.plugin.saveSettings();
+                        } else {
+                            new Notice("Invalid separator or matches standard separator.");
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Custom CSS")
+            .setDesc("Custom styling for all note types in Anki. This will be automatically synced with the mobile plugin.")
+            .addTextArea(text => {
+                text.setValue(this.plugin.settings.customCss)
+                    .onChange(async (val) => {
+                        this.plugin.settings.customCss = val;
+                        await this.plugin.saveSettings();
+                    });
+                text.inputEl.rows = 10;
+                text.inputEl.cols = 50;
+                text.inputEl.style.width = "100%";
+                text.inputEl.style.fontFamily = "monospace";
+            });
+
+        containerEl.createEl("h2", { text: "Deck & Sync Preferences" });
+
+        new Setting(containerEl)
+            .setName("Folder-based Deck Name")
+            .setDesc("If active, uses the name of the note's parent folder as the Anki deck name, translating subfolders to subdecks (e.g. Medicine/Cardiologia -> Medicine::Cardiologia). If in vault root, defaults to Default Deck Name.")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.folderBasedDeck)
+                    .onChange(val => {
+                        this.plugin.settings.folderBasedDeck = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Folder-based Tag")
+            .setDesc("If active, automatically adds the parent folder hierarchy as a nested Anki tag (e.g. Medicine/Cardiologia -> Medicine::Cardiologia).")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.folderBasedTag)
+                    .onChange(val => {
+                        this.plugin.settings.folderBasedTag = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Default Deck Name")
+            .setDesc("Deck where flashcards are added when not specified in frontmatter or folders.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.deck)
+                    .setPlaceholder("default")
+                    .onChange(val => {
+                        if (val.trim()) {
+                            this.plugin.settings.deck = val.trim();
+                            this.plugin.saveSettings();
+                        } else {
+                            new Notice("Deck name cannot be empty.");
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Context-aware Mode")
+            .setDesc("Prepend ancestor headers in your note to the flashcard question for extra context.")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.contextAwareMode)
+                    .onChange(val => {
+                        this.plugin.settings.contextAwareMode = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Context Separator")
+            .setDesc("Separator used between ancestor headings in context-aware cards.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.contextSeparator)
+                    .setPlaceholder(", ")
+                    .onChange(val => {
+                        this.plugin.settings.contextSeparator = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+
+        new Setting(containerEl)
+            .setName("Inline ID Support")
+            .setDesc("Append Anki ID block on the same line for inline cards instead of starting a new line.")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.inlineID)
+                    .onChange(val => {
+                        this.plugin.settings.inlineID = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Default Anki Tag")
+            .setDesc("This tag is added to every card synced from Obsidian (default: obsidian).")
+            .addText(text => {
+                text.setValue(this.plugin.settings.defaultAnkiTag)
+                    .setPlaceholder("obsidian")
+                    .onChange(val => {
+                        this.plugin.settings.defaultAnkiTag = val.trim().toLowerCase();
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        containerEl.createEl("h2", { text: "Advanced Note Models (Power Users)" });
+
+        new Setting(containerEl)
+            .setName("Source Support")
+            .setDesc("If enabled, adds a 'Source' field to the Anki models with a responsive Origami icon linking back to your Obsidian note. Enabled by default.")
+            .addToggle(toggle => {
+                toggle.setValue(this.plugin.settings.sourceSupport)
+                    .onChange(val => {
+                        this.plugin.settings.sourceSupport = val;
+                        this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Basic Note Model Name")
+            .setDesc("⚠️ WARNING: Changing model names will create new note types in Anki. Name of the basic note type.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.basicModel)
+                    .setPlaceholder("Obsidian-basic")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean) {
+                            this.plugin.settings.basicModel = clean;
+                            this.plugin.saveSettings();
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Reversed Note Model Name")
+            .setDesc("⚠️ WARNING: Changing model names will create new note types in Anki. Name of the reversed basic note type.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.reversedModel)
+                    .setPlaceholder("Obsidian-basic-reversed")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean) {
+                            this.plugin.settings.reversedModel = clean;
+                            this.plugin.saveSettings();
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Spaced Note Model Name")
+            .setDesc("⚠️ WARNING: Changing model names will create new note types in Anki. Name of the spaced prompt note type.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.spacedModel)
+                    .setPlaceholder("Obsidian-spaced")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean) {
+                            this.plugin.settings.spacedModel = clean;
+                            this.plugin.saveSettings();
+                        }
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Cloze Note Model Name")
+            .setDesc("⚠️ WARNING: Changing model names will create new note types in Anki. Name of the cloze note type.")
+            .addText(text => {
+                text.setValue(this.plugin.settings.clozeModel)
+                    .setPlaceholder("Obsidian-cloze")
+                    .onChange(val => {
+                        let clean = val.trim();
+                        if (clean) {
+                            this.plugin.settings.clozeModel = clean;
+                            this.plugin.saveSettings();
+                        }
+                    });
+            });
+
+        containerEl.createEl("h2", { text: "Maintenance & Troubleshooting" });
+
+        new Setting(containerEl)
+            .setName("Reset Note Type Styling")
+            .setDesc("Force-reset the CSS styling of all Flashcards Extended note types in Anki to their default minimal style. Use this to restore the defaults if your styling is broken or if you want to overwrite custom modifications in Anki.")
+            .addButton(btn => {
+                btn.setButtonText("Reset Style").onClick(() => {
+                    let client = new AnkiClient(this.plugin.settings.ankiConnectUrl);
+                    client.ping()
+                        .then(success => {
+                            if (!success) {
+                                new Notice("Failed to connect. Make sure Anki is open!");
+                                return;
+                            }
+                            new Notice("Resetting styling for all note types in Anki...");
+                            client.createModels(this.plugin.settings, true)
+                                .then(() => {
+                                    new Notice("Style successfully reset in Anki! ⚡");
+                                })
+                                .catch(err => {
+                                    new Notice("Error resetting style: " + (err.message || err));
+                                });
+                        })
+                        .catch(() => new Notice("Failed to connect. Make sure Anki is open!"));
+                });
+            });
+    }
+}
+
+// =====================================================================================
+// 8. PLUG-IN BASE INITIALIZATION CLASS
+// =====================================================================================
+class FlashcardsExtended extends Plugin {
+    async onload() {
+        await this.loadSettings();
+
+        this.cardsService = new CardsService(this.app, this.settings);
+
+        let connectionBar = this.addStatusBarItem();
+        connectionBar.setText("");
+
+        this.addCommand({
+            id: "generate-flashcard-current-file",
+            name: "Generate for the current file",
+            checkCallback: (checking) => {
+                let file = this.app.workspace.getActiveFile();
+                if (file) {
+                    if (!checking) {
+                        this.generateCards(file);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        this.addCommand({
+            id: "generate-flashcards-all-files",
+            name: "Generate for all files in the vault (Backup recommended)",
+            callback: () => {
+                let confirmed = confirm("WARNING: This will parse and sync ALL markdown files in your vault to Anki. It is highly recommended to make a backup of your vault before proceeding. Do you want to continue?");
+                if (confirmed) {
+                    this.generateCardsForAllFiles();
+                }
+            }
+        });
+
+        this.addCommand({
+            id: "insert-yaml-frontmatter-deck-tags",
+            name: "Insert empty YAML frontmatter",
+            editorCallback: (editor, view) => {
+                let currentVal = editor.getValue();
+                let match = currentVal.match(/^---\n([\s\S]*?)\n---/);
+                if (match) {
+                    let fmText = match[1];
+                    let lines = fmText.split("\n");
+                    let hasDeck = lines.some(l => l.trim().startsWith("cards-deck:"));
+                    let hasTags = lines.some(l => l.trim().startsWith("cards-tags:") || l.trim().startsWith("tags:"));
+
+                    let added = [];
+                    if (!hasDeck) added.push("cards-deck: ");
+                    if (!hasTags) added.push("cards-tags: ");
+
+                    if (added.length > 0) {
+                        let insertText = added.join("\n") + "\n";
+                        editor.replaceRange(insertText, { line: 1, ch: 0 });
+                        new Notice("YAML frontmatter updated with missing deck/tag entries!");
+                    } else {
+                        new Notice("YAML frontmatter already contains deck and tag entries!");
+                    }
+                } else {
+                    editor.replaceRange("---\ncards-deck: \ncards-tags: \n---\n\n", { line: 0, ch: 0 });
+                    new Notice("Inserted empty YAML frontmatter at the top of the note!");
+                }
+            }
+        });
+
+        this.addCommand({
+            id: "clear-anki-ids-current-file",
+            name: "Clear all Anki IDs from the current note",
+            editorCallback: (editor, view) => {
+                let currentVal = editor.getValue();
+                let cleanVal = currentVal.replace(/\s*(?:\r?\n)?(?:<!--anki:\d{13}-->|(?:\^|<!--anki:)\d{13}(?:-->)?)/g, "");
+                if (currentVal !== cleanVal) {
+                    editor.setValue(cleanVal);
+                    new Notice("All Anki IDs have been successfully removed from this note!");
+                } else {
+                    new Notice("No Anki IDs found in this note.");
+                }
+            }
+        });
+
+        addIcon("desktop-icon", `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-monitor"><rect width="20" height="14" x="2" y="3" rx="4" ry="4"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><path d="M 13.265 12.829 C 12.046 11.997 12.064 12.003 10.859 12.829 C 9.875 13.503 9.29 13.072 9.637 11.942 C 10.067 10.544 10.088 10.521 8.894 9.653 C 7.914 8.941 8.175 8.235 9.363 8.214 C 10.815 8.195 11.131 7.35 11.315 6.793 C 11.69 5.661 12.443 5.668 12.822 6.797 C 13.291 8.19 13.309 8.209 14.763 8.209 C 15.956 8.209 16.226 8.925 15.238 9.641 C 14.061 10.496 14.063 10.5 14.492 11.936 C 14.839 13.096 14.247 13.495 13.265 12.829" transform="matrix(0.965926, -0.258819, 0.258819, 0.965926, 0, 0)" transform-origin="12.068 9.549" /></svg>`);
+        this.addRibbonIcon("desktop-icon", "Generate flashcards", () => {
+            let file = this.app.workspace.getActiveFile();
+            if (file) {
+                this.generateCards(file);
+            } else {
+                new Notice("Open a markdown file before running flashcard generation.");
+            }
+        });
+
+        this.addRibbonIcon("square-chart-gantt", "Insert YAML frontmatter for deck and tags", () => {
+            let activeView = this.app.workspace.getActiveViewOfType(require("obsidian").MarkdownView);
+            if (activeView) {
+                let editor = activeView.editor;
+                let currentVal = editor.getValue();
+                let match = currentVal.match(/^---\n([\s\S]*?)\n---/);
+                if (match) {
+                    let fmText = match[1];
+                    let lines = fmText.split("\n");
+                    let hasDeck = lines.some(l => l.trim().startsWith("cards-deck:"));
+                    let hasTags = lines.some(l => l.trim().startsWith("cards-tags:") || l.trim().startsWith("tags:"));
+
+                    let added = [];
+                    if (!hasDeck) added.push("cards-deck: ");
+                    if (!hasTags) added.push("cards-tags: ");
+
+                    if (added.length > 0) {
+                        let insertText = added.join("\n") + "\n";
+                        editor.replaceRange(insertText, { line: 1, ch: 0 });
+                        new Notice("YAML frontmatter updated with missing deck/tag entries!");
+                    } else {
+                        new Notice("YAML frontmatter already contains deck and tag entries!");
+                    }
+                } else {
+                    editor.replaceRange("---\ncards-deck: \ncards-tags: \n---\n\n", { line: 0, ch: 0 });
+                    new Notice("Inserted empty YAML frontmatter at the top of the note!");
+                }
+            } else {
+                new Notice("Open a markdown note in the editor first!");
+            }
+        });
+
+        this.addSettingTab(new FlashcardsSettingTab(this.app, this));
+
+        let pingClient = new AnkiClient(this.settings.ankiConnectUrl);
+        this.registerInterval(
+            window.setInterval(() => {
+                pingClient.ping()
+                    .then(alive => {
+                        if (alive) connectionBar.setText("Anki ⚡");
+                        else connectionBar.setText("");
+                    })
+                    .catch(() => connectionBar.setText(""));
+            }, 15000)
+        );
+    }
+
+    async onunload() {
+        // onunload logic
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, this.getDefaultSettings(), await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    getDefaultSettings() {
+        return {
+            "sourceSupport": true,
+            "basicModel": "Obsidian-basic",
+            "reversedModel": "Obsidian-basic-reversed",
+            "spacedModel": "Obsidian-spaced",
+            "clozeModel": "Obsidian-cloze",
+            "contextAwareMode": false,
+            "multilineCards": false,
+            "inlineID": true,
+            "contextSeparator": ", ",
+            "deck": "default",
+            "folderBasedDeck": true,
+            "folderBasedTag": false,
+            "flashcardsTag": "card",
+            "inlineSeparator": "::",
+            "inlineSeparatorReverse": ":::",
+            "defaultAnkiTag": "obsidian",
+            "ankiConnectPermission": false,
+            "ankiConnectUrl": "http://localhost:8765",
+            "customCss": `body {
+    background-color: #000000;
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+.card {
+    background-color: #000000;
+    color: #ffffff;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 22px;
+    text-align: center;
+    line-height: 1.6;
+    border: 1px solid #ffffff;
+    border-radius: 15px;
+    padding: 30px;
+    width: 80%;
+    max-width: 600px;
+    margin: auto;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 20px rgba(255, 255, 255, 0.15);
+}
+.source-link {
+    color: #a0a0a0;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    transition: color 0.35s, transform 0.35s;
+}
+.source-link:hover {
+    color: #3b82f6;
+    transform: scale(1.05);
+}
+b, strong {
+    color: #FF005E;
+    text-shadow: 0 0 8px rgba(255, 0, 94, 0.6), 0 0 15px rgba(255, 0, 94, 0.4);
+}
+i, em {
+    color: #5EFF00;
+    text-shadow: 0 0 8px rgba(94, 255, 0, 0.6), 0 0 15px rgba(94, 255, 0, 0.4);
+}
+b i, strong em, i b, em strong {
+    color: #005EFF;
+    text-shadow: 0 0 8px rgba(0, 94, 255, 0.6), 0 0 20px rgba(0, 94, 255, 0.5);
+}`
+        };
+    }
+
+    generateCards(file) {
+        new Notice(`Generating flashcards for "${file.basename}"...`, 4000);
+        this.cardsService.execute(file)
+            .then(notifications => {
+                if (!notifications || notifications.length === 0) return;
+                for (let note of notifications) {
+                    new Notice(note, 12000);
+                }
+            })
+            .catch(err => {
+                new Notice(`Sync failed with error: ${err.message || err}`, 15000);
+            });
+    }
+
+    async generateCardsForAllFiles() {
+        let files = this.app.vault.getMarkdownFiles();
+        if (!files || files.length === 0) {
+            new Notice("No markdown files found in the vault.");
+            return;
+        }
+
+        new Notice(`Starting sync for all ${files.length} files...`, 5000);
+        let successCount = 0;
+        let failCount = 0;
+
+        for (let i = 0; i < files.length; i++) {
+            let file = files[i];
+            new Notice(`Syncing file ${i + 1} of ${files.length}: "${file.basename}"...`, 2000);
+            try {
+                let results = await this.cardsService.execute(file);
+                successCount++;
+            } catch (err) {
+                console.error(`Failed syncing "${file.path}":`, err);
+                failCount++;
+                new Notice(`Sync failed for "${file.basename}": ${err.message || err}`, 8000);
+            }
+        }
+
+        new Notice(`All vault sync complete! Successfully processed ${successCount} files. Failures: ${failCount}`, 10000);
+    }
+}
+
+module.exports = FlashcardsExtended;
